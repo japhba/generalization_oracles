@@ -674,6 +674,92 @@ def plot_confusion_matrix(eval_results: dict) -> plt.Figure:
     return fig
 
 
+def cross_validate_oracle(
+    samples: list[CollectedSample],
+    config: ExperimentConfig,
+    n_folds: int = 5,
+) -> dict:
+    """K-fold cross-validation for the oracle. Trains n_folds separate oracles,
+    each on a different train/eval split. Returns per-fold and aggregate results."""
+    from scipy.stats import binomtest
+
+    tokenizer = tr.AutoTokenizer.from_pretrained(config.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    # Build full dataset of prompts/completions
+    prompts = []
+    completions = []
+    for s in samples:
+        messages = [
+            {"role": "system", "content": ORACLE_SYSTEM_PROMPT},
+            {"role": "user", "content": s.dataset_text},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        prompts.append(prompt)
+        completions.append(s.label)
+
+    full_ds = Dataset.from_dict({"prompt": prompts, "completion": completions})
+    full_ds = full_ds.shuffle(seed=42)
+
+    fold_size = len(full_ds) // n_folds
+    fold_accuracies = []
+    all_predictions = []
+    all_true_labels = []
+
+    for fold in range(n_folds):
+        print(f"\n{'='*40} Fold {fold+1}/{n_folds} {'='*40}")
+        eval_start = fold * fold_size
+        eval_end = eval_start + fold_size
+        eval_indices = list(range(eval_start, eval_end))
+        train_indices = list(range(0, eval_start)) + list(range(eval_end, len(full_ds)))
+
+        eval_ds = full_ds.select(eval_indices)
+        train_ds = full_ds.select(train_indices)
+        print(f"  Train: {len(train_ds)}, Eval: {len(eval_ds)}")
+
+        model, tok = train_oracle(config, train_ds, eval_ds)
+        results = evaluate_oracle(model, tok, eval_ds, config)
+        fold_accuracies.append(results["accuracy"])
+        all_predictions.extend(results["predictions"])
+        all_true_labels.extend(results["true_labels"])
+        print(f"  Fold {fold+1} accuracy: {results['accuracy']:.1%}")
+
+        # Free memory between folds
+        del model, tok
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    mean_acc = np.mean(fold_accuracies)
+    std_acc = np.std(fold_accuracies)
+    n_total = len(all_predictions)
+    n_correct = sum(p == t for p, t in zip(all_predictions, all_true_labels))
+    binom = binomtest(n_correct, n_total, p=0.5, alternative="greater")
+
+    labels = sorted(set(all_true_labels + all_predictions))
+    cm = confusion_matrix(all_true_labels, all_predictions, labels=labels)
+
+    return {
+        "fold_accuracies": fold_accuracies,
+        "mean_accuracy": mean_acc,
+        "std_accuracy": std_acc,
+        "overall_accuracy": n_correct / n_total,
+        "n_correct": n_correct,
+        "n_total": n_total,
+        "p_value": binom.pvalue,
+        "ci_low": binom.proportion_ci(confidence_level=0.95).low,
+        "ci_high": binom.proportion_ci(confidence_level=0.95).high,
+        "confusion_matrix": cm,
+        "labels": labels,
+        "all_predictions": all_predictions,
+        "all_true_labels": all_true_labels,
+    }
+
+
 def plot_label_distribution(samples: list[CollectedSample]) -> plt.Figure:
     """Bar chart of sort vs reverse counts."""
     labels = [s.label for s in samples]
