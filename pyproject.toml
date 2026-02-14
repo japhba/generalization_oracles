@@ -1,0 +1,21 @@
+[project]
+name = "generalization-oracles"
+version = "0.1.0"
+description = "Predicting unintended model behaviors before training"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "transformers",
+    "datasets",
+    "peft",
+    "trl",
+    "huggingface-hub",
+    "wandb",
+    "scikit-learn",
+    "seaborn",
+    "matplotlib",
+    "numpy",
+    "pandas",
+    "tqdm",
+    "jupyter",
+]
