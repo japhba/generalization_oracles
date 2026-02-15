@@ -674,6 +674,147 @@ def plot_confusion_matrix(eval_results: dict) -> plt.Figure:
     return fig
 
 
+def evaluate_raw_baseline(
+    samples: list["CollectedSample"],
+    config: ExperimentConfig,
+) -> dict:
+    """Evaluate the raw (unfinetuned) model on the oracle task.
+    Same prompt format as the oracle, but no training — just greedy decode."""
+    from scipy.stats import binomtest
+
+    tokenizer = tr.AutoTokenizer.from_pretrained(config.model_name)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "left"
+
+    model = tr.AutoModelForCausalLM.from_pretrained(
+        config.model_name,
+        dtype=torch.bfloat16 if config.bf16 else torch.float16,
+        device_map=config.device,
+    )
+    model.eval()
+
+    prompts = []
+    completions = []
+    for s in samples:
+        messages = [
+            {"role": "system", "content": ORACLE_SYSTEM_PROMPT},
+            {"role": "user", "content": s.dataset_text},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        prompts.append(prompt)
+        completions.append(s.label)
+
+    eval_ds = Dataset.from_dict({"prompt": prompts, "completion": completions})
+    results = evaluate_oracle(model, tokenizer, eval_ds, config)
+
+    n_total = len(results["predictions"])
+    n_correct = sum(p == t for p, t in zip(results["predictions"], results["true_labels"]))
+    binom = binomtest(n_correct, n_total, p=0.5, alternative="greater")
+
+    results["n_correct"] = n_correct
+    results["n_total"] = n_total
+    results["p_value"] = binom.pvalue
+    results["ci_low"] = binom.proportion_ci(confidence_level=0.95).low
+    results["ci_high"] = binom.proportion_ci(confidence_level=0.95).high
+
+    del model
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    return results
+
+
+def cross_validate_ml_baselines(
+    df: pd.DataFrame,
+    n_folds: int = 5,
+    feature_cols: list[str] = ["num_examples", "list_length", "value_range_low", "value_range_high"],
+) -> dict[str, dict]:
+    """K-fold CV for simple ML baselines (logistic regression, MLP, random forest)
+    on tabular dataset features. Returns per-model results dict."""
+    from scipy.stats import binomtest
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.neural_network import MLPClassifier
+    from sklearn.preprocessing import StandardScaler
+
+    X = df[feature_cols].values
+    y = (df.label == "sort").astype(int).values
+
+    # Shuffle with fixed seed
+    rng = np.random.default_rng(42)
+    perm = rng.permutation(len(X))
+    X, y = X[perm], y[perm]
+
+    models = {
+        "Logistic Regression": lambda: LogisticRegression(max_iter=1000),
+        "MLP (2x64)": lambda: MLPClassifier(hidden_layer_sizes=(64, 64), max_iter=1000, random_state=42),
+        "Random Forest": lambda: RandomForestClassifier(n_estimators=100, random_state=42),
+    }
+
+    all_results = {}
+    fold_size = len(X) // n_folds
+
+    for name, model_fn in models.items():
+        fold_accs = []
+        all_preds = []
+        all_true = []
+
+        for fold in range(n_folds):
+            eval_start = fold * fold_size
+            eval_end = eval_start + fold_size
+            eval_idx = list(range(eval_start, eval_end))
+            train_idx = list(range(0, eval_start)) + list(range(eval_end, len(X)))
+
+            X_train, X_eval = X[train_idx], X[eval_idx]
+            y_train, y_eval = y[train_idx], y[eval_idx]
+
+            scaler = StandardScaler()
+            X_train = scaler.fit_transform(X_train)
+            X_eval = scaler.transform(X_eval)
+
+            clf = model_fn()
+            clf.fit(X_train, y_train)
+            preds = clf.predict(X_eval)
+
+            acc = (preds == y_eval).mean()
+            fold_accs.append(acc)
+            all_preds.extend(preds)
+            all_true.extend(y_eval)
+
+        n_correct = sum(p == t for p, t in zip(all_preds, all_true))
+        n_total = len(all_preds)
+        binom = binomtest(n_correct, n_total, p=0.5, alternative="greater")
+
+        # Convert back to string labels for confusion matrix
+        label_map = {0: "reverse", 1: "sort"}
+        pred_labels = [label_map[p] for p in all_preds]
+        true_labels = [label_map[t] for t in all_true]
+        labels = ["reverse", "sort"]
+        cm = confusion_matrix(true_labels, pred_labels, labels=labels)
+
+        all_results[name] = {
+            "fold_accuracies": fold_accs,
+            "mean_accuracy": np.mean(fold_accs),
+            "std_accuracy": np.std(fold_accs),
+            "overall_accuracy": n_correct / n_total,
+            "n_correct": n_correct,
+            "n_total": n_total,
+            "p_value": binom.pvalue,
+            "ci_low": binom.proportion_ci(confidence_level=0.95).low,
+            "ci_high": binom.proportion_ci(confidence_level=0.95).high,
+            "confusion_matrix": cm,
+            "labels": labels,
+            "all_predictions": pred_labels,
+            "all_true_labels": true_labels,
+        }
+
+    return all_results
+
+
 def cross_validate_oracle(
     samples: list[CollectedSample],
     config: ExperimentConfig,
