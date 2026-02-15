@@ -30,3 +30,4 @@ wandb/
 # Secrets
 .env
 credentials.json
+dask_logs/
